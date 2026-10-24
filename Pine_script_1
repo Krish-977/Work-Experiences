@@ -1,0 +1,275 @@
+//The startegy works the best in gold/XAU, post commision and fees, the baktest shows impressive results on 15m timeframes and onwards
+//@version=6
+strategy('A-9', overlay = true, process_orders_on_close = true, calc_on_every_tick = true, max_labels_count = 500, max_lines_count = 500, max_polylines_count = 100, margin_long = 0, margin_short = 0,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 1.29,
+     slippage = 2)
+
+// ============================================================= //
+// OPTIMAL F POSITION SIZING (always enabled)                    //
+// ============================================================= //
+i_optF = input.float(0.21, "Optimal F", minval = 0.0, maxval = 1.0, step = 0.01)
+i_fLvg = input.float(1.0, "F LVG (Optimal F Multiplier)", minval = 0.0, step = 0.1)
+i_maxLossPerContract = input.float(9794.92, "Max Loss", minval = 0.0)
+floor_on = input.bool(false, "Rounds contracts number")
+
+//Optimal f
+var tb = table.new(position.top_center, 6, 6, na, na, 0, na)
+var the_curve = array.new<chart.point>(100 + 1, na)
+var trades_pl = array.new<float>(0, 0)
+var arr_r = array.new<float>(0, 0)
+var arr_gr = array.new<float>(0, 0)
+
+var float max_loss = 0
+var float best_gr = 0
+var float best_f = 0
+
+curve_clr = #3333ff
+
+poly(_arr, _col, _t, _tr) =>
+    for t = 1 to _t by 1
+        polyline.new(_arr, false, false, xloc.bar_index, color.new(_col, 0 + t * _tr), line_width = t)
+
+f_G_function(R_array, f, NEG_INF) =>
+    float G = 1
+    int N = array.size(R_array)
+    G := 1
+    if array.size(R_array) > 0
+        for i = 0 to N - 1
+            float R = array.get(R_array, i)
+            float val = 1 + f * R
+            if val <= 0
+                G := NEG_INF
+                break
+            G := G * val
+    G
+
+method t_c(table _id, int _c, int _r, string _txt, float _val, color _col) =>
+    _id.cell(_c, _r, _txt, 0, 0, color.gray)
+    _id.cell(_c + 1, _r, str.tostring(_val, '#.##'), 0, 0, _col)
+
+method t_c_str(table _id, int _c, int _r, string _txt, string _val, color _col) =>
+    _id.cell(_c, _r, _txt, 0, 0, color.gray)
+    _id.cell(_c + 1, _r, _val, 0, 0, _col)
+
+var int processedClosedTrades = 0
+
+if strategy.closedtrades > processedClosedTrades
+    for tradeIndex = processedClosedTrades to strategy.closedtrades - 1
+        float tradeProfit = strategy.closedtrades.profit(tradeIndex)
+        float tradeSize = math.abs(strategy.closedtrades.size(tradeIndex))
+        if tradeSize > 0
+            float profitPerContract = tradeProfit / tradeSize
+            trades_pl.push(profitPerContract)
+    processedClosedTrades := strategy.closedtrades
+
+var float positionSize = 0
+effectiveF = i_optF * i_fLvg
+rawPositionSize = i_maxLossPerContract > 0 ? strategy.equity * effectiveF / i_maxLossPerContract : 0.0
+positionSize := floor_on ? math.max(math.floor(rawPositionSize), 1.0) : math.max(rawPositionSize, 0.0)
+
+if barstate.islastconfirmedhistory
+    tradesCount = trades_pl.size()
+    worstTrade = tradesCount > 0 ? array.min(trades_pl) : na
+    hasLosingTrade = not na(worstTrade) and worstTrade < 0
+
+    best_gr := 0
+    best_f := 0
+
+    if hasLosingTrade
+        max_loss := math.abs(worstTrade)
+        arr_r.clear()
+        arr_gr.clear()
+
+        for i = 0 to tradesCount - 1
+            float r = trades_pl.get(i) / max_loss
+            arr_r.push(r)
+
+        float f = 0
+        float gr_min = 0
+
+        for i = 0 to 100
+            f := i / 100.0
+            g_r = f_G_function(arr_r, f, gr_min)
+            the_curve.set(i, chart.point.from_index(bar_index - 100 + i, g_r))
+            arr_gr.push(g_r)
+            if g_r > best_gr
+                best_gr := g_r
+                best_f := f
+
+        curveMax = arr_gr.max()
+        curveMin = arr_gr.min()
+        vertical_step = 5
+
+        f := 0
+        for i = 0 to 100 by vertical_step
+            label.new(bar_index - 100 + i, curveMin, str.tostring(f, '#.##'), style = label.style_label_up, textcolor = color.gray, color = color.rgb(255, 255, 255, 100))
+            line.new(bar_index - 100 + i, curveMin, bar_index - 100 + i, curveMax, color = color.new(color.gray, 80), style = line.style_dashed)
+            f := f + vertical_step / 100
+
+        linesCount = 20
+        y_range = math.abs(curveMax - curveMin)
+
+        if y_range > 0
+            horizontal_step = y_range / (linesCount - 1)
+            for i = 0 to linesCount - 1
+                y = curveMin + horizontal_step * i
+                line.new(bar_index - 100, y, bar_index, y, extend = extend.none, style = line.style_dashed, color = color.new(color.gray, 80))
+                label.new(bar_index - 100, y, str.tostring(y, '#.##'), style = label.style_label_right, color = color.rgb(255, 255, 255, 100), textcolor = color.gray)
+
+        poly(the_curve, curve_clr, 2, 10)
+        box.new(bar_index - 100, curveMax + 0.15, bar_index, curveMin, color.gray, 1, bgcolor = na, text_color = color.black)
+    else
+        max_loss := na
+
+//END Optimal f
+
+// ============================================================= //
+// EOD TRAILING DRAWDOWN (FundedNext-style)                      //
+// Balance-based, updates once per trading day, only moves UP,   //
+// locks at starting balance once reached.                       //
+// All times resolved explicitly in America/Chicago (CT).        //
+// ============================================================= //
+dd_tz = "America/Chicago"
+
+dd_initialBalance = input.float(25000, "DD: Account Starting Balance", group = "EOD Trailing Drawdown")
+dd_trailPercent   = input.float(4.0,   "DD: Trailing Drawdown %", group = "EOD Trailing Drawdown")
+dd_trailAmount    = dd_initialBalance * dd_trailPercent / 100
+dd_haltOnBreach   = input.bool(true, "DD: Halt trading & flatten on breach", group = "EOD Trailing Drawdown",
+     tooltip = "Mirrors real account behavior — once the floor is breached, the account is done.")
+dd_tradingSession = input.session("1700-1510", "DD: Trading Session (CT: 5pm-3:10pm)", group = "EOD Trailing Drawdown",
+     tooltip = "5:00 PM CT to 3:10 PM CT next day, inside CME Globex hours (Sun 5pm - Fri 4pm CT, daily halt 4-5pm CT). Resolved in America/Chicago time.")
+
+// Balance = starting balance + realized net P&L, UNCLAMPED.
+// Losses DO reduce dd_balance (required so the floor can actually be breached).
+dd_balance = dd_initialBalance + strategy.netprofit
+
+// Detect the start of a new trading day, explicitly in CT, DST-safe.
+dd_localHour   = hour(time, dd_tz)
+dd_todayId     = year(time, dd_tz) * 10000 + month(time, dd_tz) * 100 + dayofmonth(time, dd_tz)
+dd_yesterdayTs = time - 24 * 60 * 60 * 1000
+dd_yesterdayId = year(dd_yesterdayTs, dd_tz) * 10000 + month(dd_yesterdayTs, dd_tz) * 100 + dayofmonth(dd_yesterdayTs, dd_tz)
+// Trading day flips exactly at 17:00 CT. Before 17:00 CT, the bar still
+// belongs to the trading day that started the PREVIOUS calendar date at
+// 17:00. Using year/month/dayofmonth (not raw ms arithmetic) for both
+// "today" and "24h-ago" keeps this correct across DST transitions.
+dd_dateId = dd_localHour < 17 ? dd_yesterdayId : dd_todayId
+dd_newTradingDay = ta.change(dd_dateId) != 0 and not na(dd_dateId[1])
+
+var float dd_highestEOD    = dd_initialBalance
+var float dd_trailingFloor = dd_initialBalance - dd_trailAmount
+var bool  dd_locked        = false
+var bool  dd_breached      = false
+
+if dd_newTradingDay and not dd_locked
+    dd_eodBalance = dd_balance[1]
+    if dd_eodBalance > dd_highestEOD
+        dd_highestEOD := dd_eodBalance
+        dd_proposedFloor = dd_highestEOD - dd_trailAmount
+        if dd_proposedFloor >= dd_initialBalance
+            dd_trailingFloor := dd_initialBalance
+            dd_locked := true
+        else
+            dd_trailingFloor := dd_proposedFloor
+
+// Breach detection (latches true once hit; never resets).
+// Checked against realized balance, not floating equity — confirm this
+// matches FundedNext's actual rule (balance-based vs. real-time equity).
+if not dd_breached and dd_balance < dd_trailingFloor
+    dd_breached := true
+    if dd_haltOnBreach
+        strategy.close_all(comment = "EOD DD Breach")
+
+// Market close at 3:10 PM CT: auto-close all positions
+dd_ctHour   = hour(time, dd_tz)
+dd_ctMinute = minute(time, dd_tz)
+dd_marketCloseNow  = dd_ctHour == 15 and dd_ctMinute >= 10
+dd_marketClosePrev = dd_ctHour[1] == 15 and dd_ctMinute[1] >= 10
+
+if dd_marketCloseNow and not dd_marketClosePrev
+    if strategy.position_size != 0
+        strategy.close_all(comment = "Market close 3:10 PM CT")
+
+//END EOD Trailing Drawdown
+
+//Insert your Strategy code here --------------------------------------------------------
+// ========================================================================= //
+// STRATEGY: EMA 9 + VWAP Strategy with ATR Trailing Stop - WIN THE TRADE
+// ========================================================================= //
+
+// ——— Inputs
+atrLength = input.int(14, title="ATR Length")
+atrMult   = input.float(2, title="ATR Multiplier for Trailing Stop")
+
+// ——— Indicators
+ema9 = ta.ema(close, 9)
+vwap = ta.vwap(close)
+atr  = ta.atr(atrLength)
+
+// ——— Entry Conditions
+longCondition  = ta.crossover(ema9, vwap)
+shortCondition = ta.crossunder(ema9, vwap)
+
+// ——— Entries
+tradingHoursActive = not na(time(timeframe.period, dd_tradingSession, dd_tz))
+canTrade = not (dd_haltOnBreach and dd_breached) and tradingHoursActive
+
+if longCondition and positionSize > 0 and canTrade
+    strategy.entry("Long", strategy.long, qty=positionSize)
+    alert('{"symbol":"{{ticker}}","date":"{{timenow}}","data":"buy","quantity":' + str.tostring(positionSize, '#.##') + ',"price":"{{close}}","tp":0,"sl":0,"dollar_sl":0,"percentage_sl":0,"trail":1,"trail_stop":50,"trail_trigger":0,"trail_freq":10,"token":"your_token","account_id":"your_account_id"}', alert.freq_once_per_bar_close)
+
+if shortCondition and positionSize > 0 and canTrade
+    strategy.entry("Short", strategy.short, qty=positionSize)
+    alert('{"symbol":"{{ticker}}","date":"{{timenow}}","data":"sell","quantity":' + str.tostring(positionSize, '#.##') + ',"price":"{{close}}","tp":0,"sl":0,"dollar_sl":0,"percentage_sl":0,"trail":1,"trail_stop":50,"trail_trigger":0,"trail_freq":10,"token":"your_token","account_id":"your_account_id"}', alert.freq_once_per_bar_close)
+
+// ——— Trailing Stop Exits
+strategy.exit("Long Exit", from_entry="Long", trail_points=atr * atrMult, trail_offset=atr * atrMult)
+strategy.exit("Short Exit", from_entry="Short", trail_points=atr * atrMult, trail_offset=atr * atrMult)
+
+// ——— Trailing Stop Lines
+var float longStopLine = na
+var float shortStopLine = na
+
+if strategy.position_size > 0
+    longStopLine := na(longStopLine) ? close - atr * atrMult : math.max(longStopLine, close - atr * atrMult)
+else
+    longStopLine := na
+
+if strategy.position_size < 0
+    shortStopLine := na(shortStopLine) ? close + atr * atrMult : math.min(shortStopLine, close + atr * atrMult)
+else
+    shortStopLine := na
+
+// ——— Plotting
+plot(ema9, color=color.orange, title="EMA 9", linewidth=2)
+plot(vwap, color=color.blue, title="VWAP", linewidth=2)
+plot(longStopLine, color=color.new(color.green, 20), title="Long Trail Stop", style=plot.style_linebr, linewidth=1)
+plot(shortStopLine, color=color.new(color.red, 20), title="Short Trail Stop", style=plot.style_linebr, linewidth=1)
+
+// ——— Signals
+plotshape(longCondition, title="Buy Signal", style=shape.labelup, location=location.belowbar, color=color.green, text="BUY", textcolor=color.white, size=size.small)
+plotshape(shortCondition, title="Sell Signal", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL", textcolor=color.white, size=size.small)
+//END WIN THE TRADE Strategy code
+//Insert your Strategy code here --------------------------------------------------------
+
+// ============================================================= //
+// EOD TRAILING DRAWDOWN — visuals                                //
+// ============================================================= //
+plot(dd_balance, title="DD: Balance (closed P&L)", color=color.new(color.blue, 40), linewidth=1)
+plot(dd_trailingFloor, title="DD: Trailing Floor", color=color.red, style=plot.style_stepline, linewidth=2)
+bgcolor(dd_breached ? color.new(color.red, 85) : na, title="DD Breach Zone")
+
+var table dd_info = table.new(position.bottom_right, 2, 5, border_width = 1)
+if barstate.islast
+    table.cell(dd_info, 0, 0, "Balance", text_color = color.white, bgcolor = color.gray)
+    table.cell(dd_info, 1, 0, str.tostring(dd_balance, "#,###"), text_color = color.white, bgcolor = color.gray)
+    table.cell(dd_info, 0, 1, "Highest EOD", text_color = color.white, bgcolor = color.gray)
+    table.cell(dd_info, 1, 1, str.tostring(dd_highestEOD, "#,###"), text_color = color.white, bgcolor = color.gray)
+    table.cell(dd_info, 0, 2, "Trailing Floor", text_color = color.white, bgcolor = color.gray)
+    table.cell(dd_info, 1, 2, str.tostring(dd_trailingFloor, "#,###"), text_color = color.white, bgcolor = color.gray)
+    table.cell(dd_info, 0, 3, "Locked?", text_color = color.white, bgcolor = color.gray)
+    table.cell(dd_info, 1, 3, dd_locked ? "Yes" : "No", text_color = color.white, bgcolor = color.gray)
+    table.cell(dd_info, 0, 4, "Breached?", text_color = color.white, bgcolor = color.gray)
+    table.cell(dd_info, 1, 4, dd_breached ? "YES" : "No", text_color = dd_breached ? color.red : color.white, bgcolor = color.gray)
+
+alertcondition(dd_breached, title="EOD Trailing Drawdown Breach", message="Balance has fallen below the EOD trailing drawdown floor — account would be terminated")
